@@ -1,0 +1,9 @@
+venv/
+clips/
+*.mp4
+*.avi
+*.mov
+*.mkv
+__pycache__/
+*.pyc
+data/dataset.json
