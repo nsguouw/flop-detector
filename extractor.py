@@ -1,8 +1,8 @@
 """
 extractor.py
 ------------
-Runs MediaPipe Pose on a video clip and extracts flop-relevant features
-frame by frame. Returns a structured dict ready for labeling + training.
+Runs MediaPipe Pose Landmarker on a video clip and extracts flop-relevant
+features frame by frame. Uses the new mediapipe.tasks API (0.10+).
 """
 
 import cv2
@@ -13,11 +13,12 @@ from pathlib import Path
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
     MP_AVAILABLE = True
 except ImportError:
     MP_AVAILABLE = False
     print("[warning] mediapipe not installed — run: pip install mediapipe")
-
 
 # ---------------------------------------------------------------------------
 # Landmark indices (MediaPipe Pose, 33 keypoints)
@@ -34,9 +35,10 @@ LM = {
     "right_ankle":    28,
 }
 
+DEFAULT_MODEL = "pose_landmarker.task"
+
 
 def _lm_xy(landmarks, key, w, h):
-    """Return (x_px, y_px) for a named landmark."""
     lm = landmarks[LM[key]]
     return lm.x * w, lm.y * h
 
@@ -50,7 +52,6 @@ def _dist(a, b):
 
 
 def _velocity(prev, curr):
-    """Pixel-per-frame velocity magnitude."""
     if prev is None or curr is None:
         return 0.0
     return _dist(prev, curr)
@@ -61,11 +62,6 @@ def _velocity(prev, curr):
 # ---------------------------------------------------------------------------
 
 def extract_frame_features(landmarks, prev_landmarks, w, h):
-    """
-    Given current and previous frame landmarks, return a dict of scalar
-    features relevant to flop detection.
-    """
-    # Key positions this frame
     nose        = _lm_xy(landmarks, "nose", w, h)
     l_shoulder  = _lm_xy(landmarks, "left_shoulder", w, h)
     r_shoulder  = _lm_xy(landmarks, "right_shoulder", w, h)
@@ -74,75 +70,65 @@ def extract_frame_features(landmarks, prev_landmarks, w, h):
     l_ankle     = _lm_xy(landmarks, "left_ankle", w, h)
     r_ankle     = _lm_xy(landmarks, "right_ankle", w, h)
 
-    # Derived positions
     shoulder_mid = _midpoint(l_shoulder, r_shoulder)
     hip_mid      = _midpoint(l_hip, r_hip)
     ankle_mid    = _midpoint(l_ankle, r_ankle)
 
-    # Center of gravity estimate (weighted average of shoulder, hip, ankle)
     cog = (
-        (shoulder_mid[0] * 0.3 + hip_mid[0] * 0.5 + ankle_mid[0] * 0.2),
-        (shoulder_mid[1] * 0.3 + hip_mid[1] * 0.5 + ankle_mid[1] * 0.2),
+        shoulder_mid[0] * 0.3 + hip_mid[0] * 0.5 + ankle_mid[0] * 0.2,
+        shoulder_mid[1] * 0.3 + hip_mid[1] * 0.5 + ankle_mid[1] * 0.2,
     )
 
-    # Trunk lean angle (degrees from vertical)
     dx = shoulder_mid[0] - hip_mid[0]
     dy = shoulder_mid[1] - hip_mid[1]
-    trunk_angle = math.degrees(math.atan2(dx, -dy))  # 0 = upright
+    trunk_angle = math.degrees(math.atan2(dx, -dy))
 
     features = {
-        # Positions (normalised 0–1)
-        "nose_y":        nose[1] / h,
-        "cog_y":         cog[1] / h,
-        "trunk_angle":   trunk_angle,
+        "nose_y":      nose[1] / h,
+        "cog_y":       cog[1] / h,
+        "trunk_angle": trunk_angle,
     }
 
     if prev_landmarks:
-        # Key positions previous frame
-        p_nose       = _lm_xy(prev_landmarks, "nose", w, h)
-        p_shoulder   = _midpoint(
+        p_nose     = _lm_xy(prev_landmarks, "nose", w, h)
+        p_shoulder = _midpoint(
             _lm_xy(prev_landmarks, "left_shoulder", w, h),
             _lm_xy(prev_landmarks, "right_shoulder", w, h),
         )
-        p_hip        = _midpoint(
+        p_hip = _midpoint(
             _lm_xy(prev_landmarks, "left_hip", w, h),
             _lm_xy(prev_landmarks, "right_hip", w, h),
         )
 
-        # Velocities (px/frame, normalised by frame height)
-        nose_vel       = _velocity(p_nose, nose) / h
-        shoulder_vel   = _velocity(p_shoulder, shoulder_mid) / h
-        hip_vel        = _velocity(p_hip, hip_mid) / h
+        nose_vel     = _velocity(p_nose, nose) / h
+        shoulder_vel = _velocity(p_shoulder, shoulder_mid) / h
+        hip_vel      = _velocity(p_hip, hip_mid) / h
+        head_snap    = max(0.0, nose_vel - hip_vel)
 
-        # Head snap: nose moves faster than hips (disproportionate)
-        head_snap      = max(0.0, nose_vel - hip_vel)
+        p_cog_y   = (p_shoulder[1] * 0.3 + p_hip[1] * 0.5 + ankle_mid[1] * 0.2) / h
+        fall_rate = cog[1] / h - p_cog_y
 
-        # Fall rate: downward y-velocity of COG (positive = falling)
-        p_cog_y        = (p_shoulder[1] * 0.3 + p_hip[1] * 0.5 + ankle_mid[1] * 0.2) / h
-        fall_rate      = cog[1] / h - p_cog_y
-
-        # Trunk angle change per frame
         p_dx = p_shoulder[0] - p_hip[0]
         p_dy = p_shoulder[1] - p_hip[1]
-        p_trunk = math.degrees(math.atan2(p_dx, -p_dy))
+        p_trunk     = math.degrees(math.atan2(p_dx, -p_dy))
         trunk_delta = trunk_angle - p_trunk
 
         features.update({
-            "nose_velocity":    nose_vel,
+            "nose_velocity":     nose_vel,
             "shoulder_velocity": shoulder_vel,
-            "hip_velocity":     hip_vel,
-            "head_snap":        head_snap,
-            "fall_rate":        fall_rate,
-            "trunk_delta":      trunk_delta,
+            "hip_velocity":      hip_vel,
+            "head_snap":         head_snap,
+            "fall_rate":         fall_rate,
+            "trunk_delta":       trunk_delta,
         })
     else:
         features.update({
-            "nose_velocity":    0.0,
+            "nose_velocity":     0.0,
             "shoulder_velocity": 0.0,
-            "hip_velocity":     0.0,
-            "head_snap":        0.0,
-            "fall_rate":        0.0,
-            "trunk_delta":      0.0,
+            "hip_velocity":      0.0,
+            "head_snap":         0.0,
+            "fall_rate":         0.0,
+            "trunk_delta":       0.0,
         })
 
     return features
@@ -153,14 +139,10 @@ def extract_frame_features(landmarks, prev_landmarks, w, h):
 # ---------------------------------------------------------------------------
 
 def aggregate_features(frame_features):
-    """
-    Collapse per-frame features into clip-level summary statistics
-    used by the classifier.
-    """
     if not frame_features:
         return {}
 
-    keys = [k for k in frame_features[0] if k not in ("nose_y", "cog_y")]
+    keys = [k for k in frame_features[0] if k not in ("nose_y", "cog_y", "frame_idx")]
     agg = {}
     for k in keys:
         vals = [f[k] for f in frame_features]
@@ -168,13 +150,8 @@ def aggregate_features(frame_features):
         agg[f"{k}_mean"] = float(np.mean(vals))
         agg[f"{k}_std"]  = float(np.std(vals))
 
-    # Peak fall rate (most diagnostic single feature)
-    fall_vals = [f["fall_rate"] for f in frame_features]
-    agg["peak_fall_rate"] = float(np.max(fall_vals))
-
-    # Minimum y-position of nose (how low did the head go, normalised)
-    agg["min_nose_y"] = float(np.min([f["nose_y"] for f in frame_features]))
-
+    agg["peak_fall_rate"] = float(np.max([f["fall_rate"] for f in frame_features]))
+    agg["min_nose_y"]     = float(np.min([f["nose_y"] for f in frame_features]))
     return agg
 
 
@@ -182,15 +159,7 @@ def aggregate_features(frame_features):
 # Main processing function
 # ---------------------------------------------------------------------------
 
-def process_clip(video_path: str, max_frames: int = 120) -> dict:
-    """
-    Process a single video clip. Returns a result dict with:
-      - clip_path
-      - fps, frame_count, duration_s
-      - frame_features  (list of per-frame dicts)
-      - clip_features   (aggregated dict for ML)
-      - label           (None until set by labeler)
-    """
+def process_clip(video_path: str, model_path: str = DEFAULT_MODEL, max_frames: int = 120) -> dict:
     video_path = str(video_path)
     result = {
         "clip_path":      video_path,
@@ -204,44 +173,57 @@ def process_clip(video_path: str, max_frames: int = 120) -> dict:
     }
 
     if not MP_AVAILABLE:
-        print("[extractor] mediapipe unavailable, returning empty result")
+        print("[extractor] mediapipe unavailable")
         return result
 
-    mp_pose = mp.solutions.pose
+    if not Path(model_path).exists():
+        print(f"[extractor] model file not found: {model_path}")
+        print("  Download it with:")
+        print("  curl -o pose_landmarker.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task")
+        return result
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[extractor] could not open {video_path}")
         return result
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     result["fps"]         = fps
     result["frame_count"] = min(total, max_frames)
     result["duration_s"]  = result["frame_count"] / fps
 
+    base_options = mp_python.BaseOptions(model_asset_path=model_path)
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
     frame_features = []
     prev_landmarks = None
+    frame_ms       = int(1000 / fps)
 
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as pose:
+    with mp_vision.PoseLandmarker.create_from_options(options) as landmarker:
         for i in range(min(total, max_frames)):
             ret, frame = cap.read()
             if not ret:
                 break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = pose.process(rgb)
+            rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp = i * frame_ms
 
-            if res.pose_landmarks:
-                lms = res.pose_landmarks.landmark
+            detection = landmarker.detect_for_video(mp_image, timestamp)
+
+            if detection.pose_landmarks:
+                lms   = detection.pose_landmarks[0]
                 feats = extract_frame_features(lms, prev_landmarks, w, h)
                 feats["frame_idx"] = i
                 frame_features.append(feats)
@@ -257,40 +239,28 @@ def process_clip(video_path: str, max_frames: int = 120) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Simple heuristic flop score (before ML model exists)
+# Heuristic flop score
 # ---------------------------------------------------------------------------
 
 def heuristic_flop_score(clip_features: dict) -> float:
-    """
-    Returns a 0–1 score based on hand-crafted rules.
-    Higher = more likely a flop. Used as a sanity check
-    until enough labeled data exists to train a real model.
-    """
     if not clip_features:
         return 0.0
 
     score = 0.0
 
-    # Head snap disproportionate to body movement
-    head_snap_max = clip_features.get("head_snap_max", 0)
-    if head_snap_max > 0.05:
+    if clip_features.get("head_snap_max", 0) > 0.05:
         score += 0.3
 
-    # Fast fall rate
     peak_fall = clip_features.get("peak_fall_rate", 0)
     if peak_fall > 0.04:
         score += 0.25
     if peak_fall > 0.07:
-        score += 0.15  # extra weight for very fast falls
+        score += 0.15
 
-    # Trunk whipping
-    trunk_delta_max = clip_features.get("trunk_delta_max", 0)
-    if abs(trunk_delta_max) > 15:
+    if abs(clip_features.get("trunk_delta_max", 0)) > 15:
         score += 0.2
 
-    # Head going very low
-    min_nose_y = clip_features.get("min_nose_y", 1.0)
-    if min_nose_y > 0.7:  # nose below 70% of frame height
+    if clip_features.get("min_nose_y", 1.0) > 0.7:
         score += 0.1
 
     return min(score, 1.0)
@@ -307,5 +277,7 @@ if __name__ == "__main__":
     score  = heuristic_flop_score(result["clip_features"])
     print(f"\nClip:     {path}")
     print(f"Frames:   {result['frame_count']} @ {result['fps']:.1f}fps")
-    print(f"Features: {json.dumps(result['clip_features'], indent=2)}")
-    print(f"\nHeuristic flop score: {score:.2f}")
+    print(f"Features detected in {len(result['frame_features'])} frames")
+    print(f"\nClip features:")
+    print(json.dumps(result["clip_features"], indent=2))
+    print(f"\nHeuristic flop score: {score:.2f} / 1.00  {'HIGH' if score > 0.5 else ''}")
